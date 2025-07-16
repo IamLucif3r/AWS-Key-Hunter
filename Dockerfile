@@ -1,15 +1,14 @@
 FROM golang:1.22.0-alpine AS builder
-ENV APP_DIR=/app
-WORKDIR $APP_DIR
+WORKDIR /app
+ENV GO111MODULE=on
+RUN apk add --no-cache git
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-COPY .env .env
-RUN go build -ldflags="-s -w" -o aws-key-scanner cmd/awsKeyhunter.go
+RUN go build -ldflags="-s -w" -o aws-key-scanner ./cmd/awsKeyhunter.go
 
 FROM gcr.io/distroless/static:nonroot
-USER nonroot:nonroot
 WORKDIR /app
 COPY --from=builder /app/aws-key-scanner .
-COPY --from=builder /app/.env .
+USER nonroot:nonroot
 ENTRYPOINT ["/app/aws-key-scanner"]
