@@ -3,7 +3,6 @@ package pkg
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,78 +11,54 @@ import (
 	"os"
 	"regexp"
 	"strings"
-	"time"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/google/go-github/github"
-	"golang.org/x/oauth2"
 )
-
-func WatchNewFilesatchNewFiles(githubToken string) {
-	ctx := context.Background()
-	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: githubToken})
-	client := github.NewClient(oauth2.NewClient(ctx, ts))
-
-	for {
-		log.Println("Watching for new file commits...")
-		query := "AKIA filename:.env OR filename:.ini OR filename:.yml OR filename:.yaml OR filename:.json sort:updated"
-		opt := &github.SearchOptions{Sort: "updated", Order: "desc"}
-
-		results, _, err := client.Search.Code(ctx, query, opt)
-		if err != nil {
-			log.Printf("Error searching for new files: %v", err)
-		}
-
-		for _, file := range results.CodeResults {
-			checkFileContent(ctx, client, &file)
-		}
-		time.Sleep(1 * time.Minute)
-	}
-}
 
 func checkFileContent(ctx context.Context, client *github.Client, file *github.CodeResult) {
 	content, err := fetchFileContent(ctx, client, file)
 	if err != nil {
-		log.Printf("❌ Error fetching file content: %v", err)
+		log.Printf("❌ Failed to fetch content: %v", err)
 		return
 	}
 
-	awsKeyPairs := extractAWSKeys(content)
+	credsList := extractAWSKeys(content)
+	if len(credsList) == 0 {
+		return
+	}
 
-	for _, creds := range awsKeyPairs {
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 5)
+
+	for _, creds := range credsList {
 		accessKey := creds["access_key"]
 		secretKey := creds["secret_key"]
 
-		if validateAWSKeys(accessKey, secretKey) {
-			log.Printf("🚨 Valid AWS Key Found! Repo: %s | File: %s", file.Repository.GetFullName(), file.GetHTMLURL())
-
-			sendDiscordAlert(file.Repository.GetFullName(), file.GetHTMLURL(), []string{accessKey})
+		if !looksLikeAWSKey(accessKey, secretKey) {
+			continue
 		}
-	}
-}
 
-func validateAWSKeys(accessKey, secretKey string) bool {
+		wg.Add(1)
+		sem <- struct{}{}
 
-	cfg, err := config.LoadDefaultConfig(context.TODO(),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")),
-	)
-	if err != nil {
-		log.Printf("Failed to load AWS config for key %s: %v", accessKey, err)
-		return false
-	}
+		go func(accessKey, secretKey string) {
+			defer wg.Done()
+			defer func() { <-sem }()
 
-	stsClient := sts.NewFromConfig(cfg)
-
-	_, err = stsClient.GetCallerIdentity(context.TODO(), &sts.GetCallerIdentityInput{})
-	if err != nil {
-		log.Printf("Invalid AWS Key: %s", accessKey)
-		return false
+			if validateAWSKeys(accessKey, secretKey) {
+				repo := file.Repository.GetFullName()
+				url := file.GetHTMLURL()
+				log.Printf("🚨 Valid AWS Key Detected | Repo: %s | File: %s", repo, url)
+				sendDiscordAlert(repo, url, []string{maskKey(accessKey)})
+			}
+		}(accessKey, secretKey)
 	}
 
-	log.Printf("✅ Valid AWS Key Found: %s", accessKey)
-	return true
+	wg.Wait()
 }
 
 func fetchFileContent(ctx context.Context, client *github.Client, file *github.CodeResult) (string, error) {
@@ -101,59 +76,82 @@ func fetchFileContent(ctx context.Context, client *github.Client, file *github.C
 		return "", errors.New("file content is nil")
 	}
 
-	encoding := fileContent.GetEncoding()
-
 	contentStr, err := fileContent.GetContent()
 	if err != nil {
 		return "", fmt.Errorf("error retrieving file content: %v", err)
 	}
 
-	contentStr = strings.TrimSpace(contentStr)
-
-	if encoding == "" || encoding == "none" {
-		log.Printf("ℹ️ Info: Plain text detected in %s/%s/%s", owner, repoName, filePath)
-		return contentStr, nil
-	}
-
-	if encoding == "base64" {
-
-		decodedContent, err := base64.StdEncoding.DecodeString(contentStr)
-		if err != nil {
-			log.Printf("⚠️ Warning: Expected base64 encoding but got plain text in %s/%s/%s", owner, repoName, filePath)
-			return contentStr, nil
-		}
-		return string(decodedContent), nil
-	}
-
-	return "", fmt.Errorf("unknown encoding type: %s", encoding)
+	return strings.TrimSpace(contentStr), nil
 }
 
 func extractAWSKeys(content string) []map[string]string {
 	awsKeys := []map[string]string{}
 
-	accessKeyPattern := regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
+	re := regexp.MustCompile(`(?i)(aws_access_key_id.*?(AKIA[0-9A-Z]{16})).*?(aws_secret_access_key.*?([a-zA-Z0-9/+]{40}))`)
+	matches := re.FindAllStringSubmatch(content, -1)
 
-	secretKeyPattern := regexp.MustCompile(`[a-zA-Z0-9/+]{40}`)
-
-	accessKeys := accessKeyPattern.FindAllString(content, -1)
-	secretKeys := secretKeyPattern.FindAllString(content, -1)
-
-	for i := range accessKeys {
-		if i < len(secretKeys) {
+	for _, match := range matches {
+		if len(match) >= 5 {
 			awsKeys = append(awsKeys, map[string]string{
-				"access_key": accessKeys[i],
-				"secret_key": secretKeys[i],
+				"access_key": match[2],
+				"secret_key": match[4],
 			})
+		}
+	}
+
+	if len(awsKeys) == 0 {
+		accessKeyPattern := regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
+		secretKeyPattern := regexp.MustCompile(`[a-zA-Z0-9/+]{40}`)
+
+		accessKeys := accessKeyPattern.FindAllString(content, -1)
+		secretKeys := secretKeyPattern.FindAllString(content, -1)
+
+		for i := range accessKeys {
+			if i < len(secretKeys) {
+				awsKeys = append(awsKeys, map[string]string{
+					"access_key": accessKeys[i],
+					"secret_key": secretKeys[i],
+				})
+			}
 		}
 	}
 
 	return awsKeys
 }
 
+func looksLikeAWSKey(accessKey, secretKey string) bool {
+	return len(accessKey) == 20 && len(secretKey) == 40
+}
+
+func validateAWSKeys(accessKey, secretKey string) bool {
+	cfg, err := config.LoadDefaultConfig(context.TODO(),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")),
+	)
+	if err != nil {
+		return false
+	}
+
+	stsClient := sts.NewFromConfig(cfg)
+	_, err = stsClient.GetCallerIdentity(context.TODO(), &sts.GetCallerIdentityInput{})
+	return err == nil
+}
+
+func maskKey(key string) string {
+	if len(key) < 8 {
+		return "****"
+	}
+	return key[:4] + "****" + key[len(key)-4:]
+}
+
 func sendDiscordAlert(repo, url string, keys []string) {
 	webhookURL := os.Getenv("DISCORD_WEBHOOK")
+	if webhookURL == "" {
+		log.Println("⚠️  DISCORD_WEBHOOK not set, skipping alert.")
+		return
+	}
+
 	message := map[string]string{
-		"content": fmt.Sprintf("🚨 AWS Key Leak Detected!\nRepo: %s\nURL: %s\nKeys: %v", repo, url, keys),
+		"content": fmt.Sprintf("🚨 *AWS Key Leak Detected!*\n**Repo**: `%s`\n**URL**: %s\n**Keys**: `%v`", repo, url, keys),
 	}
 	jsonData, _ := json.Marshal(message)
 
@@ -163,10 +161,10 @@ func sendDiscordAlert(repo, url string, keys []string) {
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("Error sending alert to Discord: %v", err)
+		log.Printf("❌ Failed to send alert to Discord: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 
-	log.Println("🚨 Alert sent to Discord successfully!")
+	log.Println("📣 Alert sent to Discord.")
 }

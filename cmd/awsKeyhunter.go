@@ -6,38 +6,48 @@ import (
 	"os"
 	"time"
 
-	"github.com/iamlucif3r/aws-key-hunter/internal/pkg"
 	"github.com/joho/godotenv"
+
+	"github.com/iamlucif3r/aws-key-hunter/internal/pkg"
 )
 
 const (
 	Red    = "\033[31m"
-	Yellow = "033[33m"
-	Green  = "033[32m"
+	Yellow = "\033[33m"
+	Green  = "\033[32m"
 	Reset  = "\033[0m"
 )
 
 func init() {
-	err := godotenv.Load(".env")
-	if err != nil {
-		log.Fatal("Error loading .env file")
+	if err := godotenv.Load(".env"); err != nil {
+		log.Println("⚠️  No .env file found, falling back to environment variables...")
 	}
 }
+
 func main() {
-	fmt.Println(Red + "┏┓┓ ┏┏┓  ┓┏┓      ┓┏     		" + Reset)
-	fmt.Println(Red + "┣┫┃┃┃┗┓━━┃┫ ┏┓┓┏━━┣┫┓┏┏┓╋┏┓┏┓	" + Reset)
-	fmt.Println(Red + "┛┗┗┻┛┗┛  ┛┗┛┗ ┗┫  ┛┗┗┻┛┗┗┗ ┛ 	" + Reset)
-	fmt.Println(Red + "               ┛   v1.0.0      	" + Reset)
-	fmt.Println()
-	log.Println(Yellow + "🚀 Starting AWS Key Scanner..." + Reset)
+	fmt.Println(Red + `
+┏┓┓ ┏┏┓  ┓┏┓      ┓┏     		
+┣┫┃┃┃┗┓━━┃┫ ┏┓┓┏━━┣┫┓┏┏┓╋┏┓┏┓	
+┛┗┗┻┛┗┛  ┛┗┛┗ ┗┫  ┛┗┗┻┛┗┗┗ ┛  	
+               ┛   v1.0.1      	
+` + Reset)
+
+	log.Println(Yellow + "🚀 Starting AWS Key Hunter..." + Reset)
 
 	githubToken := os.Getenv("GITHUB_TOKEN")
 	if githubToken == "" {
-		log.Fatal("GITHUB_TOKEN is not set")
+		log.Fatal("❌ GITHUB_TOKEN is not set in environment")
 	}
-	go pkg.WatchNewFilesatchNewFiles(githubToken)
+
+	go func() {
+		for {
+			pkg.SearchGithub(githubToken, "updated")
+			time.Sleep(2 * time.Minute)
+		}
+	}()
+
 	for {
-		pkg.SearchGithub(githubToken)
-		time.Sleep(1 * time.Minute)
+		pkg.SearchGithub(githubToken, "indexed")
+		time.Sleep(5 * time.Minute)
 	}
 }
