@@ -29,6 +29,9 @@ docker run --rm -d --name aws-scanner aws-key-scanner
 
 Running Locally
 ```bash
+echo "GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" > .env
+echo "DISCORD_WEBHOOK=https://discord.com/api/webhooks/..." >> .env
+
 go run main.go
 ```
 
