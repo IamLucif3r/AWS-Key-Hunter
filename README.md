@@ -23,6 +23,9 @@ docker build -t aws-key-scanner .
 Run the container
 ```bash
 docker run --rm -d --name aws-scanner aws-key-scanner
+
+# Recommended: Don't bulid your dockerfile with .env file into it, instead pass them as environment variables:
+docker run -e GITHUB_TOKEN="<your-github-token>" -e DISCORD_WEBHOOK="<discord-webhook-url>" aws-key-hunter:latest
 ```
 
 ## Usage 🛠
